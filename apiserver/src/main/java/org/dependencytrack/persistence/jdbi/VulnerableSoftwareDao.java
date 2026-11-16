@@ -55,6 +55,65 @@ public final class VulnerableSoftwareDao {
         this.jdbiHandle = requireNonNull(jdbiHandle, "jdbiHandle must not be null");
     }
 
+    /// Column list of `VULNERABLESOFTWARE` rows, qualified with the `vs` alias,
+    /// shared by all queries that map rows to [VulnerableSoftware] beans.
+    private static final String VS_COLUMNS = """
+                         , vs."ID"
+                         , vs."PURL_TYPE"
+                         , vs."PURL_NAMESPACE"
+                         , vs."PURL_NAME"
+                         , vs."PURL_QUALIFIERS"
+                         , vs."PURL_SUBPATH"
+                         , vs."CPE22"
+                         , vs."CPE23"
+                         , vs."PART"
+                         , vs."VENDOR"
+                         , vs."PRODUCT"
+                         , vs."VERSION"
+                         , vs."UPDATE"
+                         , vs."EDITION"
+                         , vs."LANGUAGE"
+                         , vs."SWEDITION"
+                         , vs."TARGETSW"
+                         , vs."TARGETHW"
+                         , vs."OTHER"
+                         , vs."VERSIONENDEXCLUDING"
+                         , vs."VERSIONENDINCLUDING"
+                         , vs."VERSIONSTARTEXCLUDING"
+                         , vs."VERSIONSTARTINCLUDING"
+                         , vs."VULNERABLE"
+                    """;
+
+    public Map<UUID, List<VulnerableSoftware>> getByVulnerabilityUuids(final Collection<UUID> vulnUuids) {
+        if (vulnUuids.isEmpty()) {
+            return Map.of();
+        }
+
+        return jdbiHandle
+                .createQuery(/* language=SQL */ """
+                    SELECT v."UUID" AS "VULN_UUID"
+                    """ + VS_COLUMNS + """
+                      FROM "VULNERABLESOFTWARE" AS vs
+                     INNER JOIN "VULNERABLESOFTWARE_VULNERABILITIES" AS vsv
+                        ON vs."ID" = vsv."VULNERABLESOFTWARE_ID"
+                     INNER JOIN "VULNERABILITY" AS v
+                        ON vsv."VULNERABILITY_ID" = v."ID"
+                     WHERE v."UUID" = ANY(:vulnUuids)
+                       AND (   vs."VERSIONSTARTINCLUDING"  IS NOT NULL
+                            OR vs."VERSIONSTARTEXCLUDING"  IS NOT NULL
+                            OR vs."VERSIONENDINCLUDING"    IS NOT NULL
+                            OR vs."VERSIONENDEXCLUDING"   IS NOT NULL)
+                    """)
+                .bind("vulnUuids", vulnUuids.toArray(UUID[]::new))
+                .registerRowMapper(BeanMapper.factory(VulnerableSoftware.class))
+                .reduceRows(new HashMap<UUID, List<VulnerableSoftware>>(), (vsByVulnUuid, row) -> {
+                    vsByVulnUuid
+                            .computeIfAbsent(row.getColumn("VULN_UUID", UUID.class), _ -> new ArrayList<>())
+                            .add(row.getRow(VulnerableSoftware.class));
+                    return vsByVulnUuid;
+                });
+    }
+
     public void syncAll(
             Vulnerability.Source source,
             Map<VulnerabilityKey, Long> vulnIdByKey,
@@ -215,30 +274,7 @@ public final class VulnerableSoftwareDao {
         return jdbiHandle
                 .createQuery(/* language=SQL */ """
                     SELECT vsv."VULNERABILITY_ID"
-                         , vs."ID"
-                         , vs."PURL_TYPE"
-                         , vs."PURL_NAMESPACE"
-                         , vs."PURL_NAME"
-                         , vs."PURL_QUALIFIERS"
-                         , vs."PURL_SUBPATH"
-                         , vs."CPE22"
-                         , vs."CPE23"
-                         , vs."PART"
-                         , vs."VENDOR"
-                         , vs."PRODUCT"
-                         , vs."VERSION"
-                         , vs."UPDATE"
-                         , vs."EDITION"
-                         , vs."LANGUAGE"
-                         , vs."SWEDITION"
-                         , vs."TARGETSW"
-                         , vs."TARGETHW"
-                         , vs."OTHER"
-                         , vs."VERSIONENDEXCLUDING"
-                         , vs."VERSIONENDINCLUDING"
-                         , vs."VERSIONSTARTEXCLUDING"
-                         , vs."VERSIONSTARTINCLUDING"
-                         , vs."VULNERABLE"
+                    """ + VS_COLUMNS + """
                       FROM "VULNERABLESOFTWARE_VULNERABILITIES" AS vsv
                      INNER JOIN "VULNERABLESOFTWARE" AS vs
                         ON vs."ID" = vsv."VULNERABLESOFTWARE_ID"

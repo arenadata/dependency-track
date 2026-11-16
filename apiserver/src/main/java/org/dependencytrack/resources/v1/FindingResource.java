@@ -41,19 +41,27 @@ import org.dependencytrack.auth.Permissions;
 import org.dependencytrack.common.pagination.Page;
 import org.dependencytrack.dex.engine.api.DexEngine;
 import org.dependencytrack.dex.engine.api.request.CreateWorkflowRunRequest;
+import org.dependencytrack.dex.engine.api.response.CreateWorkflowRunResponse;
 import org.dependencytrack.integrations.FindingPackagingFormat;
+import org.dependencytrack.model.AnalysisState;
 import org.dependencytrack.model.Finding;
 import org.dependencytrack.model.GroupedFinding;
 import org.dependencytrack.model.Project;
 import org.dependencytrack.model.RepositoryType;
 import org.dependencytrack.model.Vulnerability;
+import org.dependencytrack.model.VulnerableSoftware;
 import org.dependencytrack.model.validation.ValidUuid;
 import org.dependencytrack.persistence.QueryManager;
 import org.dependencytrack.persistence.jdbi.FindingDao;
+import org.dependencytrack.persistence.jdbi.ProjectDao;
+import org.dependencytrack.persistence.jdbi.VulnerableSoftwareDao;
 import org.dependencytrack.pkgmetadata.PackageMetadata;
 import org.dependencytrack.pkgmetadata.PackageMetadataDao;
 import org.dependencytrack.pkgmetadata.ResolvePackageMetadataWorkflow;
 import org.dependencytrack.proto.internal.workflow.v1.AnalyzeProjectWorkflowArg;
+import org.dependencytrack.report.FixedVersionResolver;
+import org.dependencytrack.report.VulnerabilityCsvReportWriter;
+import org.dependencytrack.report.VulnerabilityReportRow;
 import org.dependencytrack.resources.v1.openapi.PaginatedApi;
 import org.dependencytrack.resources.v1.problems.ProblemDetails;
 import org.dependencytrack.resources.v1.vo.BomUploadResponse;
@@ -81,12 +89,17 @@ import java.io.StringWriter;
 import java.io.Writer;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.dependencytrack.dex.DexWorkflowLabels.WF_LABEL_ANALYSIS_TRIGGER;
 import static org.dependencytrack.dex.DexWorkflowLabels.WF_LABEL_PROJECT_UUID;
@@ -323,6 +336,135 @@ public class FindingResource extends AbstractV1ApiResource {
         }
     }
 
+    @GET
+    @Path("/project/{uuid}/report.csv")
+    @Produces("text/csv")
+    @Operation(
+            summary = "Returns the vulnerabilities of a project as a CSV report",
+            description = "<p>Requires permission <strong>VIEW_VULNERABILITY</strong></p>")
+    @ApiResponses(
+            value = {
+                @ApiResponse(
+                        responseCode = "200",
+                        description = "The vulnerabilities of the project as a CSV report",
+                        content = @Content(schema = @Schema(type = "string"), mediaType = "text/csv")),
+                @ApiResponse(responseCode = "401", description = "Unauthorized"),
+                @ApiResponse(
+                        responseCode = "403",
+                        description = "Access to the requested project is forbidden",
+                        content =
+                                @Content(
+                                        schema = @Schema(implementation = ProblemDetails.class),
+                                        mediaType = ProblemDetails.MEDIA_TYPE_JSON)),
+                @ApiResponse(responseCode = "404", description = "The project could not be found")
+            })
+    @PermissionRequired(Permissions.Constants.VIEW_VULNERABILITY)
+    public Response exportVulnerabilityCsvReport(
+            @Parameter(
+                            description = "The UUID of the project",
+                            schema = @Schema(type = "string", format = "uuid"),
+                            required = true)
+                    @PathParam("uuid")
+                    @ValidUuid
+                    String uuid) {
+        try (QueryManager qm = new QueryManager(getAlpineRequest())) {
+            final Project project = qm.getObjectByUuid(Project.class, uuid);
+            if (project == null) {
+                return Response.status(Response.Status.NOT_FOUND)
+                        .entity("The project could not be found.")
+                        .build();
+            }
+            requireAccess(qm, project);
+
+            final List<VulnerabilityReportRow> reportRows = withJdbiHandle(getAlpineRequest(), handle -> {
+                // Suppressed findings carry the triage decisions (e.g. FALSE_POSITIVE)
+                // the report is meant to communicate, so they are always included.
+                final List<ProjectDao.CollectionDescendantRow> collectionDescendants =
+                        handle.attach(ProjectDao.class).getCollectionDescendantProjects(project.getUuid());
+                final boolean isCollectionExport = !collectionDescendants.isEmpty();
+                final List<Long> projectIds = isCollectionExport
+                        ? Stream.concat(
+                                        Stream.of(project.getId()),
+                                        collectionDescendants.stream().map(ProjectDao.CollectionDescendantRow::id))
+                                .toList()
+                        : List.of(project.getId());
+
+                final List<FindingDao.FindingRow> findings =
+                        handle.attach(FindingDao.class).selectAllProjectsFindings(projectIds, true);
+                if (findings.isEmpty()) {
+                    return List.of();
+                }
+
+                final Map<UUID, List<VulnerableSoftware>> vulnerableSoftwareByVulnUuid = new VulnerableSoftwareDao(
+                                handle)
+                        .getByVulnerabilityUuids(findings.stream()
+                                .map(FindingDao.FindingRow::vulnUuid)
+                                .collect(Collectors.toSet()));
+                final FixedVersionResolver fixedVersionResolver = new FixedVersionResolver();
+                return findings.stream()
+                        .sorted(FINDING_ROW_ORDER)
+                        .map(row -> toReportRow(
+                                row,
+                                vulnerableSoftwareByVulnUuid.getOrDefault(row.vulnUuid(), List.of()),
+                                fixedVersionResolver))
+                        .toList();
+            });
+
+            final byte[] csv = new VulnerabilityCsvReportWriter().write(reportRows);
+            return Response.ok(csv, "text/csv")
+                    .header("Content-Disposition", "attachment; filename=\"%s\"".formatted(reportFileName(project)))
+                    .build();
+        }
+    }
+
+    private static final Comparator<FindingDao.FindingRow> FINDING_ROW_ORDER = Comparator.comparingInt(
+                    (FindingDao.FindingRow row) ->
+                            row.vulnSeverity() == null ? -1 : row.vulnSeverity().getLevel())
+            .reversed()
+            .thenComparing(FindingDao.FindingRow::vulnId, Comparator.nullsFirst(Comparator.naturalOrder()));
+
+    private static VulnerabilityReportRow toReportRow(
+            final FindingDao.FindingRow row,
+            final List<VulnerableSoftware> vulnerableSoftware,
+            final FixedVersionResolver fixedVersionResolver) {
+        final String fixedIn = fixedVersionResolver.resolve(
+                row.componentPurl(), row.componentCpe(), row.componentVersion(), vulnerableSoftware);
+        // The report names the project (package) each finding belongs to,
+        // mirroring the analysts' report format.
+        return new VulnerabilityReportRow(
+                row.projectName(),
+                row.componentName(),
+                row.componentVersion(),
+                purlType(row.componentPurl()),
+                row.vulnId(),
+                row.vulnSeverity() == null ? null : row.vulnSeverity().name(),
+                fixedIn,
+                row.vulnDescription(),
+                row.analysisState() == null || row.analysisState() == AnalysisState.NOT_SET
+                        ? null
+                        : row.analysisState().name(),
+                row.analysisDetail());
+    }
+
+    private static @Nullable String purlType(final @Nullable String purl) {
+        final PackageURL parsedPurl = PurlUtil.silentPurl(purl);
+        return parsedPurl == null ? null : parsedPurl.getType();
+    }
+
+    private static String reportFileName(final Project project) {
+        final String date = DateTimeFormatter.ofPattern("ddMMyyyy").format(LocalDate.now(ZoneOffset.UTC));
+        // ASCII only: header values are encoded as ISO-8859-1, non-ASCII characters
+        // would be mangled on their way to the client.
+        final String sanitized = "%s_%s_CVE_%s"
+                .formatted(
+                        project.getName() == null ? "" : project.getName(),
+                        project.getVersion() == null ? "" : project.getVersion(),
+                        date)
+                .replaceAll("[^A-Za-z0-9._-]", "_")
+                .replaceAll("_{2,}", "_");
+        return sanitized + ".csv";
+    }
+
     @POST
     @Path("/project/{uuid}/analyze")
     @Produces(MediaType.APPLICATION_JSON)
@@ -357,31 +499,69 @@ public class FindingResource extends AbstractV1ApiResource {
         final var projectUuid = UUID.fromString(uuid);
         useJdbiHandle(getAlpineRequest(), handle -> requireProjectAccess(handle, projectUuid));
 
-        final UUID runId = dexEngine.createRun(new CreateWorkflowRunRequest<>(AnalyzeProjectWorkflow.class)
-                .withWorkflowInstanceId(AnalyzeProjectWorkflow.instanceIdForManual(projectUuid))
-                .withConcurrencyKey(AnalyzeProjectWorkflow.concurrencyKeyForProject(projectUuid))
-                .withLabels(Map.ofEntries(
-                        Map.entry(
-                                WF_LABEL_ANALYSIS_TRIGGER,
-                                AnalyzeProjectWorkflow.triggerLabelValue(ANALYSIS_TRIGGER_MANUAL)),
-                        Map.entry(WF_LABEL_PROJECT_UUID, uuid),
-                        Map.entry(WF_LABEL_TRIGGERED_BY, getPrincipal().getName())))
-                .withPriority(75)
-                .withArgument(AnalyzeProjectWorkflowArg.newBuilder()
-                        .setProjectUuid(uuid)
-                        .setTrigger(ANALYSIS_TRIGGER_MANUAL)
-                        .build()));
-        if (runId == null) {
+        // Collection projects have no components of their own; analysis is fanned out
+        // to their descendants instead, excluding nested collections (their own
+        // descendants are already part of the set).
+        final List<ProjectDao.CollectionDescendantRow> analysisTargets = withJdbiHandle(getAlpineRequest(), handle -> {
+            final List<ProjectDao.CollectionDescendantRow> descendants =
+                    handle.attach(ProjectDao.class).getCollectionDescendantProjects(projectUuid);
+            if (descendants.isEmpty()) {
+                final Long rootId = handle.attach(ProjectDao.class).getProjectId(projectUuid);
+                if (rootId == null) {
+                    return List.of();
+                }
+                return List.of(new ProjectDao.CollectionDescendantRow(rootId, projectUuid, null));
+            }
+            return descendants.stream()
+                    .filter(row -> row.collectionLogic() == null)
+                    .toList();
+        });
+
+        final Map<UUID, Long> projectIdByRequestId = new HashMap<>();
+        final List<CreateWorkflowRunRequest<AnalyzeProjectWorkflowArg>> requests = analysisTargets.stream()
+                .map(target -> {
+                    final var request = new CreateWorkflowRunRequest<>(AnalyzeProjectWorkflow.class)
+                            .withWorkflowInstanceId(AnalyzeProjectWorkflow.instanceIdForManual(target.uuid()))
+                            .withConcurrencyKey(AnalyzeProjectWorkflow.concurrencyKeyForProject(target.uuid()))
+                            .withLabels(Map.ofEntries(
+                                    Map.entry(
+                                            WF_LABEL_ANALYSIS_TRIGGER,
+                                            AnalyzeProjectWorkflow.triggerLabelValue(ANALYSIS_TRIGGER_MANUAL)),
+                                    Map.entry(
+                                            WF_LABEL_PROJECT_UUID, target.uuid().toString()),
+                                    Map.entry(
+                                            WF_LABEL_TRIGGERED_BY,
+                                            getPrincipal().getName())))
+                            .withPriority(75)
+                            .withArgument(AnalyzeProjectWorkflowArg.newBuilder()
+                                    .setProjectUuid(target.uuid().toString())
+                                    .setTrigger(ANALYSIS_TRIGGER_MANUAL)
+                                    .build());
+                    projectIdByRequestId.put(request.requestId(), target.id());
+                    return request;
+                })
+                .toList();
+
+        // The engine drops a request when an analysis for the project is still in progress.
+        // Those projects keep their old timestamp, so a later attempt offers them again.
+        final List<CreateWorkflowRunResponse> responses = dexEngine.createRuns(requests);
+        final long[] startedProjectIds = responses.stream()
+                .map(CreateWorkflowRunResponse::requestId)
+                .map(projectIdByRequestId::get)
+                .filter(Objects::nonNull)
+                .mapToLong(Long::longValue)
+                .toArray();
+        if (startedProjectIds.length == 0) {
             return Response.status(Response.Status.CONFLICT).build();
         }
 
         useJdbiTransaction(
-                handle -> handle.attach(ProjectLastAnalysisDao.class).recordAttempt(projectUuid, Instant.now()));
+                handle -> handle.attach(ProjectLastAnalysisDao.class).recordAttempt(startedProjectIds, Instant.now()));
 
         dexEngine.createRun(new CreateWorkflowRunRequest<>(ResolvePackageMetadataWorkflow.class)
                 .withWorkflowInstanceId(ResolvePackageMetadataWorkflow.INSTANCE_ID));
 
-        return Response.ok(Map.of("token", runId)).build();
+        return Response.ok(Map.of("token", responses.getFirst().runId())).build();
     }
 
     @GET

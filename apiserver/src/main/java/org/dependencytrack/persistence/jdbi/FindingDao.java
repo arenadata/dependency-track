@@ -38,6 +38,7 @@ import org.jspecify.annotations.Nullable;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -237,7 +238,7 @@ public interface FindingDao extends PaginationSupport {
                AND c."PROJECT_ID" = a."PROJECT_ID"
               INNER JOIN "PROJECT" AS p
                 ON c."PROJECT_ID" = p."ID"
-            WHERE c."PROJECT_ID" = :projectId
+            WHERE c."PROJECT_ID" = ANY(:projectIds)
             <#if source>
                AND v."SOURCE" = :source
             </#if>
@@ -292,7 +293,7 @@ public interface FindingDao extends PaginationSupport {
     @DefineNamedBindings
     @RegisterConstructorMapper(FindingRow.class)
     List<FindingRow> selectFindingsByProject(
-            @Bind long projectId,
+            @Bind Collection<Long> projectIds,
             @Define boolean includeInactive,
             @Define boolean includeSuppressed,
             @Nullable @Bind String searchText,
@@ -352,7 +353,7 @@ public interface FindingDao extends PaginationSupport {
                     ON c."ID" = a."COMPONENT_ID"
                    AND v."ID" = a."VULNERABILITY_ID"
                    AND c."PROJECT_ID" = a."PROJECT_ID"
-                 WHERE c."PROJECT_ID" = :projectId
+                 WHERE c."PROJECT_ID" = ANY(:projectIds)
             <#if source>
                    AND v."SOURCE" = :source
             </#if>
@@ -387,7 +388,7 @@ public interface FindingDao extends PaginationSupport {
     @DefineNamedBindings
     @AllowUnusedBindings
     long selectFindingsByProjectBoundedCount(
-            @Bind long projectId,
+            @Bind Collection<Long> projectIds,
             @Define boolean includeInactive,
             @Define boolean includeSuppressed,
             @Nullable @Bind String searchText,
@@ -425,7 +426,7 @@ public interface FindingDao extends PaginationSupport {
             BigDecimal epssTo,
             Boolean isKev) {
         return withJitDisabled(() -> selectFindingsByProject(
-                projectId,
+                List.of(projectId),
                 /* includeInactive */ false,
                 includeSuppressed,
                 searchText,
@@ -434,6 +435,24 @@ public interface FindingDao extends PaginationSupport {
                 epssFrom,
                 epssTo,
                 isKev,
+                // NB: No caller reads the total, so don't pay for the window count.
+                /* emitTotalCount */ false,
+                /* paginate */ false));
+    }
+
+    /// Queries the findings of multiple projects, unpaginated, and without a total count.
+    /// Used for collection projects, whose report aggregates the findings of their descendants.
+    default List<FindingRow> selectAllProjectsFindings(Collection<Long> projectIds, boolean includeSuppressed) {
+        return withJitDisabled(() -> selectFindingsByProject(
+                projectIds,
+                /* includeInactive */ false,
+                includeSuppressed,
+                /* searchText */ null,
+                /* hasAnalysis */ null,
+                /* source */ null,
+                /* epssFrom */ null,
+                /* epssTo */ null,
+                /* isKev */ null,
                 // NB: No caller reads the total, so don't pay for the window count.
                 /* emitTotalCount */ false,
                 /* paginate */ false));
@@ -454,7 +473,7 @@ public interface FindingDao extends PaginationSupport {
             @Nullable Integer totalCountThreshold) {
         return withJitDisabled(() -> {
             final List<FindingRow> rows = selectFindingsByProject(
-                    projectId,
+                    List.of(projectId),
                     /* includeInactive */ false,
                     includeSuppressed,
                     searchText,
@@ -466,7 +485,7 @@ public interface FindingDao extends PaginationSupport {
                     /* emitTotalCount */ totalCountThreshold == null,
                     /* paginate */ true);
             final LongSupplier countQuery = () -> selectFindingsByProjectBoundedCount(
-                    projectId,
+                    List.of(projectId),
                     /* includeInactive */ false,
                     includeSuppressed,
                     searchText,
