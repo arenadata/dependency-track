@@ -119,6 +119,7 @@
         <lib.caffeine.version>3.3.1</lib.caffeine.version>
         <lib.cel-java.version>0.14.0</lib.cel-java.version>
         <lib.commons-codec.version>1.23.0</lib.commons-codec.version>
+        <lib.commons-csv.version>1.14.0</lib.commons-csv.version>
         <lib.commons-lang3.version>3.21.0</lib.commons-lang3.version>
         <lib.commons-logging.version>1.4.0</lib.commons-logging.version>
         <lib.cpe-parser.version>3.0.1</lib.cpe-parser.version>
@@ -241,6 +242,11 @@
                 <groupId>commons-codec</groupId>
                 <artifactId>commons-codec</artifactId>
                 <version>${lib.commons-codec.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-csv</artifactId>
+                <version>${lib.commons-csv.version}</version>
             </dependency>
             <dependency>
                 <groupId>org.apache.commons</groupId>

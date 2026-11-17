@@ -33,12 +33,15 @@ import org.dependencytrack.model.ProjectMetadata;
 import org.dependencytrack.persistence.jdbi.command.CloneProjectCommand;
 import org.dependencytrack.persistence.jdbi.query.ListProjectsConciseQuery;
 import org.dependencytrack.persistence.jdbi.query.ListProjectsQuery;
+import org.jdbi.v3.core.mapper.RowMapper;
 import org.jdbi.v3.core.mapper.reflect.ColumnName;
 import org.jdbi.v3.core.statement.Query;
+import org.jdbi.v3.core.statement.StatementContext;
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException;
 import org.jdbi.v3.json.Json;
 import org.jdbi.v3.sqlobject.SqlObject;
 import org.jdbi.v3.sqlobject.config.RegisterConstructorMapper;
+import org.jdbi.v3.sqlobject.config.RegisterRowMapper;
 import org.jdbi.v3.sqlobject.customizer.AllowUnusedBindings;
 import org.jdbi.v3.sqlobject.customizer.Bind;
 import org.jdbi.v3.sqlobject.customizer.BindMap;
@@ -48,6 +51,8 @@ import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 import org.jspecify.annotations.Nullable;
 import org.postgresql.util.PSQLException;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -66,6 +71,69 @@ import static org.dependencytrack.util.PersistenceUtil.escapeLikePattern;
  */
 @RegisterConstructorMapper(ProjectDao.ConciseProjectListRow.class)
 public interface ProjectDao extends SqlObject, PaginationSupport {
+
+    /// Returns the direct and nested descendant projects of a collection project,
+    /// following the same aggregation rules as [COLLECTION_METRICS_SUBQUERY]:
+    /// which children are included depends on their parent's collection logic
+    /// and collection tag. Nested collections are traversed using their own logic.
+    /// Inactive projects are excluded.
+    ///
+    /// Returns an empty list when the project is not a collection.
+    @SqlQuery("""
+            WITH RECURSIVE descendants AS (
+              SELECT p."ID" AS project_id
+                   , p."UUID" AS project_uuid
+                   , p."COLLECTION_LOGIC" AS collection_logic
+                   , p."COLLECTION_TAG_ID" AS collection_tag_id
+                FROM "PROJECT" p
+               WHERE p."UUID" = :projectUuid
+                 AND p."COLLECTION_LOGIC" IS NOT NULL
+              UNION ALL
+              SELECT child."ID" AS project_id
+                   , child."UUID" AS project_uuid
+                   , child."COLLECTION_LOGIC" AS collection_logic
+                   , child."COLLECTION_TAG_ID" AS collection_tag_id
+                FROM descendants d
+                INNER JOIN "PROJECT_HIERARCHY" AS ph
+                   ON ph."PARENT_PROJECT_ID" = d.project_id
+                  AND ph."DEPTH" = 1
+                INNER JOIN "PROJECT" AS child
+                   ON child."ID" = ph."CHILD_PROJECT_ID"
+                  AND child."INACTIVE_SINCE" IS NULL
+               WHERE d.collection_logic IS NOT NULL
+                 AND (
+                   d.collection_logic != 'AGGREGATE_DIRECT_CHILDREN_WITH_TAG'
+                   OR EXISTS (
+                     SELECT 1
+                       FROM "PROJECTS_TAGS" AS pt
+                      WHERE pt."PROJECT_ID" = child."ID"
+                        AND pt."TAG_ID" = d.collection_tag_id
+                   )
+                 )
+                 AND (
+                   d.collection_logic != 'AGGREGATE_LATEST_VERSION_CHILDREN'
+                   OR child."IS_LATEST"
+                 )
+            ) CYCLE project_id SET is_cycle USING path
+            SELECT project_id AS "id"
+                 , project_uuid AS "uuid"
+                 , collection_logic AS "collectionLogic"
+              FROM descendants
+            """)
+    @RegisterRowMapper(ProjectDao.CollectionDescendantRowMapper.class)
+    List<CollectionDescendantRow> getCollectionDescendantProjects(@Bind("projectUuid") UUID projectUuid);
+
+    record CollectionDescendantRow(
+            long id, UUID uuid, @Nullable String collectionLogic) {}
+
+    class CollectionDescendantRowMapper implements RowMapper<CollectionDescendantRow> {
+
+        @Override
+        public CollectionDescendantRow map(final ResultSet rs, final StatementContext ctx) throws SQLException {
+            return new CollectionDescendantRow(
+                    rs.getLong("id"), rs.getObject("uuid", UUID.class), rs.getString("collectionLogic"));
+        }
+    }
 
     /// Aggregates `PROJECTMETRICS` rows of a single collection project's
     /// descendants into one row. Intended to be embedded as the body of a

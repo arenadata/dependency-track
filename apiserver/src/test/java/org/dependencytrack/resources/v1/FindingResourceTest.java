@@ -33,6 +33,7 @@ import org.dependencytrack.ResourceTest;
 import org.dependencytrack.auth.Permissions;
 import org.dependencytrack.dex.engine.api.DexEngine;
 import org.dependencytrack.dex.engine.api.request.CreateWorkflowRunRequest;
+import org.dependencytrack.dex.engine.api.response.CreateWorkflowRunResponse;
 import org.dependencytrack.epss.Epss;
 import org.dependencytrack.epss.EpssDao;
 import org.dependencytrack.kevdatasource.api.KevAssertion;
@@ -42,14 +43,18 @@ import org.dependencytrack.model.Component;
 import org.dependencytrack.model.ComponentOccurrence;
 import org.dependencytrack.model.ConfigPropertyConstants;
 import org.dependencytrack.model.Project;
+import org.dependencytrack.model.ProjectCollectionLogic;
 import org.dependencytrack.model.Severity;
+import org.dependencytrack.model.Tag;
 import org.dependencytrack.model.Vulnerability;
 import org.dependencytrack.model.VulnerabilityKey;
+import org.dependencytrack.model.VulnerableSoftware;
 import org.dependencytrack.persistence.command.MakeAnalysisCommand;
 import org.dependencytrack.persistence.jdbi.KevDao;
 import org.dependencytrack.persistence.jdbi.VulnerabilityAliasDao;
 import org.dependencytrack.pkgmetadata.PackageMetadata;
 import org.dependencytrack.pkgmetadata.PackageMetadataDao;
+import org.dependencytrack.pkgmetadata.ResolvePackageMetadataWorkflow;
 import org.eclipse.microprofile.config.ConfigProvider;
 import org.glassfish.hk2.utilities.binding.AbstractBinder;
 import org.glassfish.jersey.server.ResourceConfig;
@@ -76,6 +81,7 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
 import java.util.LinkedHashMap;
@@ -97,7 +103,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -1199,9 +1205,15 @@ public class FindingResourceTest extends ResourceTest {
         project.setName("Acme Example");
         project = qm.persist(project);
 
-        doReturn(UUID.fromString("d93df5a0-f29e-4ee1-9c98-cee4dd243750"))
+        final UUID runId = UUID.fromString("d93df5a0-f29e-4ee1-9c98-cee4dd243750");
+        doAnswer(invocation -> {
+                    final Collection<? extends CreateWorkflowRunRequest<?>> requests = invocation.getArgument(0);
+                    return requests.stream()
+                            .map(request -> new CreateWorkflowRunResponse(request.requestId(), runId))
+                            .toList();
+                })
                 .when(DEX_ENGINE_MOCK)
-                .createRun(ArgumentMatchers.<CreateWorkflowRunRequest<?>>any());
+                .createRuns(ArgumentMatchers.any());
 
         Response response = jersey.target("%s/project/%s/analyze".formatted(V1_FINDING, project.getUuid()))
                 .request()
@@ -1214,13 +1226,12 @@ public class FindingResourceTest extends ResourceTest {
                 }
                 """);
 
-        //noinspection unchecked
-        ArgumentCaptor<CreateWorkflowRunRequest<?>> dexCreateRunCaptor =
-                ArgumentCaptor.forClass(CreateWorkflowRunRequest.class);
-        verify(DEX_ENGINE_MOCK, times(2)).createRun(dexCreateRunCaptor.capture());
+        final ArgumentCaptor<Collection<CreateWorkflowRunRequest<?>>> dexCreateRunsCaptor = ArgumentCaptor.captor();
+        verify(DEX_ENGINE_MOCK, times(1)).createRuns(dexCreateRunsCaptor.capture());
 
+        assertThat(dexCreateRunsCaptor.getAllValues().getFirst()).hasSize(1);
         CreateWorkflowRunRequest<?> createDexRunRequest =
-                dexCreateRunCaptor.getAllValues().getFirst();
+                dexCreateRunsCaptor.getAllValues().getFirst().iterator().next();
         assertThat(createDexRunRequest.workflowName()).isEqualTo("analyze-project");
         assertThat(createDexRunRequest.workflowVersion()).isEqualTo(1);
         assertThat(createDexRunRequest.workflowInstanceId()).isEqualTo("analyze-project-manual:" + project.getUuid());
@@ -1255,6 +1266,74 @@ public class FindingResourceTest extends ResourceTest {
                 """);
 
         verify(DEX_ENGINE_MOCK, never()).createRun(ArgumentMatchers.<CreateWorkflowRunRequest<?>>any());
+    }
+
+    @Test
+    public void analyzeProjectCollectionShouldCreateWorkflowRunsForChildrenTest() {
+        initializeWithPermissions(Permissions.VULNERABILITY_ANALYSIS);
+
+        var root = new Project();
+        root.setName("ADH");
+        root.setVersion("4.4.0");
+        root.setCollectionLogic(ProjectCollectionLogic.AGGREGATE_DIRECT_CHILDREN);
+        root = qm.persist(root);
+
+        var childA = new Project();
+        childA.setName("adh-airflow");
+        childA.setParent(root);
+        qm.persist(childA);
+        final Project persistedChildA = childA;
+
+        var childB = new Project();
+        childB.setName("adh-hadoop");
+        childB.setParent(root);
+        qm.persist(childB);
+        final Project persistedChildB = childB;
+
+        doAnswer(invocation -> {
+                    final Collection<? extends CreateWorkflowRunRequest<?>> requests = invocation.getArgument(0);
+                    return requests.stream()
+                            .map(request -> new CreateWorkflowRunResponse(
+                                    request.requestId(), UUID.fromString("d93df5a0-f29e-4ee1-9c98-cee4dd243750")))
+                            .toList();
+                })
+                .when(DEX_ENGINE_MOCK)
+                .createRuns(ArgumentMatchers.any());
+
+        Response response = jersey.target("%s/project/%s/analyze".formatted(V1_FINDING, root.getUuid()))
+                .request()
+                .header(X_API_KEY, apiKey)
+                .post(Entity.json("{}"));
+        assertThat(response.getStatus()).isEqualTo(200);
+
+        final ArgumentCaptor<Collection<CreateWorkflowRunRequest<?>>> dexCreateRunsCaptor = ArgumentCaptor.captor();
+        final ArgumentCaptor<CreateWorkflowRunRequest<?>> dexSingleRunCaptor =
+                ArgumentCaptor.forClass(CreateWorkflowRunRequest.class);
+        verify(DEX_ENGINE_MOCK, times(1)).createRuns(dexCreateRunsCaptor.capture());
+        verify(DEX_ENGINE_MOCK, times(1)).createRun(dexSingleRunCaptor.capture());
+
+        // One analyze-project run per non-collection child of the collection.
+        assertThat(dexCreateRunsCaptor.getAllValues().getFirst())
+                .hasSize(2)
+                .satisfiesExactlyInAnyOrder(
+                        request -> {
+                            assertThat(request.workflowInstanceId())
+                                    .isEqualTo("analyze-project-manual:" + persistedChildA.getUuid());
+                            assertThat(request.labels())
+                                    .containsEntry(
+                                            "project_uuid",
+                                            persistedChildA.getUuid().toString());
+                        },
+                        request -> {
+                            assertThat(request.workflowInstanceId())
+                                    .isEqualTo("analyze-project-manual:" + persistedChildB.getUuid());
+                            assertThat(request.labels())
+                                    .containsEntry(
+                                            "project_uuid",
+                                            persistedChildB.getUuid().toString());
+                        });
+        assertThat(dexSingleRunCaptor.getAllValues().getFirst().workflowInstanceId())
+                .isEqualTo(ResolvePackageMetadataWorkflow.INSTANCE_ID);
     }
 
     @Test
@@ -2791,6 +2870,266 @@ public class FindingResourceTest extends ResourceTest {
         return Stream.of(
                 Arguments.of("INTERNAL", "/unit/sarif/expected-internal.sarif.json"),
                 Arguments.of(null, "/unit/sarif/expected-all.sarif.json"));
+    }
+
+    @Test
+    public void exportVulnerabilityCsvReportTest() {
+        initializeWithPermissions(Permissions.VIEW_VULNERABILITY);
+
+        final Project project = qm.createProject("Acme Example", null, "1.0", null, null, null, null, false);
+
+        final Component parent = createComponent(project, "Component A", "1.0");
+        parent.setPurl("pkg:maven/com.example/component-a@1.0");
+        qm.updateComponent(parent, false);
+
+        final Component child = createComponent(project, "lib", "1.5");
+        child.setParent(parent);
+        child.setPurl("pkg:maven/com.example/lib@1.5");
+        qm.updateComponent(child, false);
+
+        final Vulnerability vulnCritical = createVulnerability(
+                "Vuln-1",
+                Severity.CRITICAL,
+                "Title",
+                "Description",
+                "Recommendation",
+                80,
+                Vulnerability.Source.INTERNAL);
+        qm.addVulnerability(vulnCritical, child, "none");
+
+        final Vulnerability vulnHigh = createVulnerability(
+                "Vuln-2",
+                Severity.HIGH,
+                "Title 2",
+                "Description 2",
+                "Recommendation 2",
+                666,
+                Vulnerability.Source.INTERNAL);
+        qm.addVulnerability(vulnHigh, parent, "none");
+
+        final var vulnerableSoftware = new VulnerableSoftware();
+        vulnerableSoftware.setPurlType("maven");
+        vulnerableSoftware.setPurlNamespace("com.example");
+        vulnerableSoftware.setPurlName("lib");
+        vulnerableSoftware.setVersionStartIncluding("1.0");
+        vulnerableSoftware.setVersionEndExcluding("2.0");
+        vulnerableSoftware.setVulnerable(true);
+        vulnerableSoftware.addVulnerability(vulnCritical);
+        qm.persist(vulnerableSoftware);
+
+        qm.makeAnalysis(new MakeAnalysisCommand(child, vulnCritical)
+                .withState(AnalysisState.RESOLVED)
+                .withDetails("Обновили до 2.0"));
+
+        final Response response = jersey.target(V1_FINDING + "/project/" + project.getUuid() + "/report.csv")
+                .request()
+                .header(X_API_KEY, apiKey)
+                .get(Response.class);
+
+        assertEquals(200, response.getStatus(), 0);
+        assertThat(response.getHeaderString("Content-Type")).contains("text/csv");
+        assertThat(response.getHeaderString("Content-Disposition")).contains(".csv");
+
+        final String body = getPlainTextBody(response);
+        assertThat(body).startsWith("\uFEFF");
+        assertThat(body).endsWith("\r\n");
+        final List<String> lines = body.substring(1).lines().toList();
+        assertThat(lines).hasSize(3);
+        assertThat(lines.get(0))
+                .isEqualTo("Project,Library,Version,Type,Vulnerability,Severity,"
+                        + "Fixed in,Description,Disposition,Mitigation");
+        assertThat(lines.get(1))
+                .isEqualTo("Acme Example,lib,1.5,maven,Vuln-1,CRITICAL,2.0,Description,RESOLVED,Обновили до 2.0");
+        assertThat(lines.get(2)).isEqualTo("Acme Example,Component A,1.0,maven,Vuln-2,HIGH,,Description 2,,");
+    }
+
+    @Test
+    public void exportVulnerabilityCsvReportShouldUseAsciiFileNameTest() {
+        initializeWithPermissions(Permissions.VIEW_VULNERABILITY);
+
+        final Project project = qm.createProject("Пример", null, "1.0", null, null, null, null, false);
+        qm.addVulnerability(
+                createVulnerability("Vuln-1", Severity.HIGH), createComponent(project, "Component A", "1.0"), "none");
+
+        final Response response = jersey.target(V1_FINDING + "/project/" + project.getUuid() + "/report.csv")
+                .request()
+                .header(X_API_KEY, apiKey)
+                .get(Response.class);
+
+        assertEquals(200, response.getStatus(), 0);
+        final String disposition = response.getHeaderString("Content-Disposition");
+        assertThat(disposition).matches("attachment; filename=\"[A-Za-z0-9._-]+\\.csv\"");
+    }
+
+    @Test
+    public void exportVulnerabilityCsvReportCollectionTest() {
+        initializeWithPermissions(Permissions.VIEW_VULNERABILITY);
+
+        var root = new Project();
+        root.setName("ADH");
+        root.setVersion("4.4.0");
+        root.setCollectionLogic(ProjectCollectionLogic.AGGREGATE_DIRECT_CHILDREN);
+        root = qm.persist(root);
+
+        var childA = new Project();
+        childA.setName("adh-airflow");
+        childA.setParent(root);
+        childA = qm.persist(childA);
+
+        var childB = new Project();
+        childB.setName("adh-hadoop");
+        childB.setParent(root);
+        childB = qm.persist(childB);
+
+        final Component componentA = createComponent(childA, "anyio", "3.7.1");
+        qm.addVulnerability(
+                createVulnerability(
+                        "Vuln-1",
+                        Severity.CRITICAL,
+                        "Title",
+                        "Description A",
+                        "Recommendation",
+                        80,
+                        Vulnerability.Source.INTERNAL),
+                componentA,
+                "none");
+
+        final Component componentB = createComponent(childB, "avro", "1.11.2");
+        qm.addVulnerability(
+                createVulnerability(
+                        "Vuln-2",
+                        Severity.HIGH,
+                        "Title",
+                        "Description B",
+                        "Recommendation",
+                        80,
+                        Vulnerability.Source.INTERNAL),
+                componentB,
+                "none");
+
+        final Response response = jersey.target(V1_FINDING + "/project/" + root.getUuid() + "/report.csv")
+                .request()
+                .header(X_API_KEY, apiKey)
+                .get(Response.class);
+
+        assertEquals(200, response.getStatus(), 0);
+        final List<String> lines =
+                getPlainTextBody(response).substring(1).lines().toList();
+        assertThat(lines).hasSize(3);
+        assertThat(lines.get(1)).isEqualTo("adh-airflow,anyio,3.7.1,,Vuln-1,CRITICAL,,Description A,,");
+        assertThat(lines.get(2)).isEqualTo("adh-hadoop,avro,1.11.2,,Vuln-2,HIGH,,Description B,,");
+    }
+
+    @Test
+    public void exportVulnerabilityCsvReportCollectionWithTagTest() {
+        initializeWithPermissions(Permissions.VIEW_VULNERABILITY);
+
+        final Tag collectionTag = qm.createTag("cve-report");
+        var root = new Project();
+        root.setName("ADH");
+        root.setVersion("4.4.0");
+        root.setCollectionLogic(ProjectCollectionLogic.AGGREGATE_DIRECT_CHILDREN_WITH_TAG);
+        root.setCollectionTag(collectionTag);
+        root = qm.persist(root);
+
+        var taggedChild = new Project();
+        taggedChild.setName("adh-airflow");
+        taggedChild.setParent(root);
+        qm.persist(taggedChild);
+        qm.bind(taggedChild, Set.of(collectionTag));
+
+        var untaggedChild = new Project();
+        untaggedChild.setName("adh-untagged");
+        untaggedChild.setParent(root);
+        qm.persist(untaggedChild);
+
+        qm.addVulnerability(
+                createVulnerability(
+                        "Vuln-1",
+                        Severity.HIGH,
+                        "Title",
+                        "Description",
+                        "Recommendation",
+                        80,
+                        Vulnerability.Source.INTERNAL),
+                createComponent(taggedChild, "anyio", "3.7.1"),
+                "none");
+        qm.addVulnerability(
+                createVulnerability(
+                        "Vuln-2",
+                        Severity.MEDIUM,
+                        "Title",
+                        "Description 2",
+                        "Recommendation",
+                        80,
+                        Vulnerability.Source.INTERNAL),
+                createComponent(untaggedChild, "avro", "1.11.2"),
+                "none");
+
+        final Response response = jersey.target(V1_FINDING + "/project/" + root.getUuid() + "/report.csv")
+                .request()
+                .header(X_API_KEY, apiKey)
+                .get(Response.class);
+
+        assertEquals(200, response.getStatus(), 0);
+        final List<String> lines =
+                getPlainTextBody(response).substring(1).lines().toList();
+        assertThat(lines).hasSize(2);
+        assertThat(lines.get(1)).isEqualTo("adh-airflow,anyio,3.7.1,,Vuln-1,HIGH,,Description,,");
+    }
+
+    @Test
+    public void exportVulnerabilityCsvReportAclTest() {
+        initializeWithPermissions(Permissions.VIEW_VULNERABILITY);
+        enablePortfolioAccessControl();
+
+        final Project project = qm.createProject("acme-app", null, "1.0", null, null, null, null, false);
+
+        final Response response = jersey.target(V1_FINDING + "/project/" + project.getUuid() + "/report.csv")
+                .request()
+                .header(X_API_KEY, apiKey)
+                .get(Response.class);
+
+        assertEquals(403, response.getStatus(), 0);
+    }
+
+    @Test
+    public void exportVulnerabilityCsvReportShouldIncludeSuppressedFindingsTest() {
+        initializeWithPermissions(Permissions.VIEW_VULNERABILITY);
+
+        final Project project = qm.createProject("Acme Example", null, "1.0", null, null, null, null, false);
+        final Component component = createComponent(project, "Component A", "1.0");
+        final Vulnerability vuln = createVulnerability(
+                "Vuln-1", Severity.HIGH, "Title", "Description", "Recommendation", 80, Vulnerability.Source.INTERNAL);
+        qm.addVulnerability(vuln, component, "none");
+        qm.makeAnalysis(new MakeAnalysisCommand(component, vuln)
+                .withState(AnalysisState.FALSE_POSITIVE)
+                .withDetails("Не используется в проекте")
+                .withSuppress(true));
+
+        final Response response = jersey.target(V1_FINDING + "/project/" + project.getUuid() + "/report.csv")
+                .request()
+                .header(X_API_KEY, apiKey)
+                .get(Response.class);
+
+        assertEquals(200, response.getStatus(), 0);
+        final String body = getPlainTextBody(response);
+        assertThat(body.substring(1).lines().toList()).hasSize(2);
+        assertThat(body.lines().toList().get(1))
+                .isEqualTo(
+                        "Acme Example,Component A,1.0,,Vuln-1,HIGH,,Description,FALSE_POSITIVE,Не используется в проекте");
+    }
+
+    @Test
+    public void exportVulnerabilityCsvReportShouldReturnNotFoundTest() {
+        initializeWithPermissions(Permissions.VIEW_VULNERABILITY);
+
+        final Response response = jersey.target(V1_FINDING + "/project/" + UUID.randomUUID() + "/report.csv")
+                .request()
+                .header(X_API_KEY, apiKey)
+                .get(Response.class);
+
+        assertEquals(404, response.getStatus(), 0);
     }
 
     private Component createComponent(Project project, String name, String version) {

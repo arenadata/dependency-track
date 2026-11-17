@@ -452,6 +452,11 @@
             <groupId>io.github.resilience4j</groupId>
             <artifactId>resilience4j-core</artifactId>
         </dependency>
+        <!-- CSV -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-csv</artifactId>
+        </dependency>
         <!-- YAML -->
         <dependency>
             <groupId>com.fasterxml.jackson.dataformat</groupId>
